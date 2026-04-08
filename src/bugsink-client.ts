@@ -155,6 +155,158 @@ export interface CreateReleaseInput {
   timestamp?: string;
 }
 
+// ============================================================================
+// Composite cursor — bridges Bugsink's server-page cursor with client-side
+// `limit` slicing so that paginating with a small limit doesn't silently skip
+// items inside a server page.
+//
+// A composite cursor encodes:
+//   c: the Bugsink server cursor for the page that contains the next item
+//      (null = first page)
+//   o: the offset within that filtered page where the next item begins.
+//      A negative value means "from the end" (used by `previous` cursors so we
+//      can resume reading from the tail of the prior server page without
+//      having to know its length up front).
+//
+// The encoded form is base64url(JSON), wrapped in a fake `?cursor=` URL so it
+// flows through the same `next`/`previous` URL plumbing the API uses.
+// ============================================================================
+
+interface CompositeCursor {
+  c: string | null;
+  o: number;
+}
+
+const COMPOSITE_URL_PREFIX = 'http://composite.local/?cursor=';
+
+function encodeCompositeCursor(cursor: CompositeCursor): string {
+  return Buffer.from(JSON.stringify(cursor)).toString('base64url');
+}
+
+function decodeCompositeCursor(token: string): CompositeCursor {
+  let json: string;
+  try {
+    json = Buffer.from(token, 'base64url').toString('utf-8');
+  } catch {
+    throw new Error('Invalid cursor: not valid base64url');
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    throw new Error('Invalid cursor: not valid JSON');
+  }
+  if (
+    typeof parsed !== 'object' ||
+    parsed === null ||
+    typeof (parsed as { o: unknown }).o !== 'number' ||
+    ((parsed as { c: unknown }).c !== null && typeof (parsed as { c: unknown }).c !== 'string')
+  ) {
+    throw new Error('Invalid cursor: malformed structure');
+  }
+  return parsed as CompositeCursor;
+}
+
+function extractCursorFromUrl(url: string | null | undefined): string | null {
+  if (!url) return null;
+  try {
+    return new URL(url).searchParams.get('cursor');
+  } catch {
+    return null;
+  }
+}
+
+function compositeToUrl(cursor: CompositeCursor | null): string | null {
+  return cursor ? `${COMPOSITE_URL_PREFIX}${encodeCompositeCursor(cursor)}` : null;
+}
+
+/**
+ * Paginate a Bugsink list endpoint with client-side filtering and `limit`
+ * slicing, while keeping pagination correct across server-page boundaries.
+ *
+ * `fetchServerPage` is called with a server cursor (or null for the first
+ * page) and must return a raw `PaginatedResponse<T>`. `filter` is applied to
+ * each fetched server page before slicing.
+ *
+ * To fill `limit` when the slice straddles a server page boundary, this helper
+ * may fetch a second server page in a single call. Beyond that it stops, so
+ * `limit` larger than ~2x the server page size will be under-filled (the
+ * returned `next` cursor still works to continue).
+ */
+async function paginateWithLimit<T>(
+  fetchServerPage: (serverCursor: string | null) => Promise<PaginatedResponse<T>>,
+  filter: (items: T[]) => T[],
+  limit: number,
+  inputCursor: string | undefined,
+): Promise<PaginatedResponse<T>> {
+  const composite = inputCursor ? decodeCompositeCursor(inputCursor) : null;
+  const startServerCursor = composite?.c ?? null;
+  let startOffset = composite?.o ?? 0;
+
+  const startPage = await fetchServerPage(startServerCursor);
+  const filteredStart = filter(startPage.results);
+
+  // Resolve negative offset (from end) into a concrete index
+  if (startOffset < 0) {
+    startOffset = Math.max(0, filteredStart.length + startOffset);
+  } else {
+    startOffset = Math.min(startOffset, filteredStart.length);
+  }
+
+  let results = filteredStart.slice(startOffset, startOffset + limit);
+
+  // State describing where this user-page ended, used to compute `next`
+  let endServerCursor: string | null = startServerCursor;
+  let endPage: PaginatedResponse<T> = startPage;
+  let endFiltered: T[] = filteredStart;
+  let endOffset = startOffset + results.length;
+
+  // If we didn't fill `limit`, spill into one more server page
+  if (results.length < limit && startPage.next) {
+    const nextServerCursor = extractCursorFromUrl(startPage.next);
+    if (nextServerCursor !== null) {
+      const nextPage = await fetchServerPage(nextServerCursor);
+      const filteredNext = filter(nextPage.results);
+      const needed = limit - results.length;
+      const fromNext = filteredNext.slice(0, needed);
+      results = results.concat(fromNext);
+      endServerCursor = nextServerCursor;
+      endPage = nextPage;
+      endFiltered = filteredNext;
+      endOffset = fromNext.length;
+    }
+  }
+
+  // Compute forward (`next`) cursor
+  let nextComposite: CompositeCursor | null = null;
+  if (endOffset < endFiltered.length) {
+    nextComposite = { c: endServerCursor, o: endOffset };
+  } else if (endPage.next) {
+    const nextCursor = extractCursorFromUrl(endPage.next);
+    if (nextCursor !== null) {
+      nextComposite = { c: nextCursor, o: 0 };
+    }
+  }
+
+  // Compute backward (`previous`) cursor
+  let prevComposite: CompositeCursor | null = null;
+  if (startOffset > 0) {
+    prevComposite = { c: startServerCursor, o: Math.max(0, startOffset - limit) };
+  } else if (startPage.previous) {
+    const prevCursor = extractCursorFromUrl(startPage.previous);
+    if (prevCursor !== null) {
+      // Negative offset = "from the end of that page", resolved on next call.
+      prevComposite = { c: prevCursor, o: -limit };
+    }
+  }
+
+  return {
+    results,
+    next: compositeToUrl(nextComposite),
+    previous: compositeToUrl(prevComposite),
+  };
+}
+
 export class BugsinkClient {
   private baseUrl: string;
   private apiToken: string;
@@ -187,8 +339,13 @@ export class BugsinkClient {
   /**
    * List all projects
    */
-  async listProjects(): Promise<PaginatedResponse<Project>> {
-    return this.fetch<PaginatedResponse<Project>>('/projects/');
+  async listProjects(options?: { cursor?: string }): Promise<PaginatedResponse<Project>> {
+    const params = new URLSearchParams();
+    if (options?.cursor) {
+      params.set('cursor', options.cursor);
+    }
+    const qs = params.toString();
+    return this.fetch<PaginatedResponse<Project>>(`/projects/${qs ? `?${qs}` : ''}`);
   }
 
   /**
@@ -201,36 +358,54 @@ export class BugsinkClient {
   /**
    * List all teams
    */
-  async listTeams(): Promise<PaginatedResponse<Team>> {
-    return this.fetch<PaginatedResponse<Team>>('/teams/');
+  async listTeams(options?: { cursor?: string }): Promise<PaginatedResponse<Team>> {
+    const params = new URLSearchParams();
+    if (options?.cursor) {
+      params.set('cursor', options.cursor);
+    }
+    const qs = params.toString();
+    return this.fetch<PaginatedResponse<Team>>(`/teams/${qs ? `?${qs}` : ''}`);
   }
 
   /**
-   * List issues for a project
+   * List issues for a project.
+   *
+   * Bugsink's API only supports cursor-based pagination and exposes no `status`
+   * filter (per the OpenAPI spec: only `cursor`, `project`, `sort`, `order` are
+   * accepted). `limit` and `status` are enforced client-side via the composite
+   * cursor helper, so paginating with a small `limit` walks through items
+   * correctly across server-page boundaries.
    */
   async listIssues(projectId: number, options?: {
     status?: string;
     limit?: number;
     sort?: 'digest_order' | 'last_seen';
     order?: 'asc' | 'desc';
+    cursor?: string;
   }): Promise<PaginatedResponse<Issue>> {
-    const params = new URLSearchParams();
-    params.set('project', projectId.toString());
+    const limit = options?.limit ?? 25;
 
-    if (options?.status) {
-      params.set('status', options.status);
-    }
-    if (options?.limit) {
-      params.set('limit', options.limit.toString());
-    }
-    if (options?.sort) {
-      params.set('sort', options.sort);
-    }
-    if (options?.order) {
-      params.set('order', options.order);
-    }
+    const fetchServerPage = (serverCursor: string | null) => {
+      const params = new URLSearchParams();
+      params.set('project', projectId.toString());
+      if (options?.sort) params.set('sort', options.sort);
+      if (options?.order) params.set('order', options.order);
+      if (serverCursor) params.set('cursor', serverCursor);
+      return this.fetch<PaginatedResponse<Issue>>(`/issues/?${params.toString()}`);
+    };
 
-    return this.fetch<PaginatedResponse<Issue>>(`/issues/?${params.toString()}`);
+    const filter = (items: Issue[]): Issue[] => {
+      if (!options?.status) return items;
+      const wanted = options.status.toLowerCase();
+      return items.filter((issue) => {
+        if (wanted === 'resolved') return issue.is_resolved;
+        if (wanted === 'muted') return issue.is_muted;
+        if (wanted === 'unresolved') return !issue.is_resolved && !issue.is_muted;
+        return true;
+      });
+    };
+
+    return paginateWithLimit(fetchServerPage, filter, limit, options?.cursor);
   }
 
   /**
@@ -241,19 +416,27 @@ export class BugsinkClient {
   }
 
   /**
-   * List events for an issue
+   * List events for an issue.
+   *
+   * Bugsink's API only supports cursor-based pagination (per the OpenAPI spec:
+   * only `cursor`, `issue`, `order` are accepted). `limit` is enforced
+   * client-side via the composite cursor helper, so paginating with a small
+   * `limit` walks through events correctly across server-page boundaries.
    */
   async listEvents(issueId: string, options?: {
     limit?: number;
+    cursor?: string;
   }): Promise<PaginatedResponse<Event>> {
-    const params = new URLSearchParams();
-    params.set('issue', issueId);
+    const limit = options?.limit ?? 10;
 
-    if (options?.limit) {
-      params.set('limit', options.limit.toString());
-    }
+    const fetchServerPage = (serverCursor: string | null) => {
+      const params = new URLSearchParams();
+      params.set('issue', issueId);
+      if (serverCursor) params.set('cursor', serverCursor);
+      return this.fetch<PaginatedResponse<Event>>(`/events/?${params.toString()}`);
+    };
 
-    return this.fetch<PaginatedResponse<Event>>(`/events/?${params.toString()}`);
+    return paginateWithLimit(fetchServerPage, (items) => items, limit, options?.cursor);
   }
 
   /**
@@ -363,8 +546,13 @@ export class BugsinkClient {
   /**
    * List releases for a project
    */
-  async listReleases(projectId: number): Promise<PaginatedResponse<Release>> {
-    return this.fetch<PaginatedResponse<Release>>(`/releases/?project=${projectId}`);
+  async listReleases(projectId: number, options?: { cursor?: string }): Promise<PaginatedResponse<Release>> {
+    const params = new URLSearchParams();
+    params.set('project', projectId.toString());
+    if (options?.cursor) {
+      params.set('cursor', options.cursor);
+    }
+    return this.fetch<PaginatedResponse<Release>>(`/releases/?${params.toString()}`);
   }
 
   /**
