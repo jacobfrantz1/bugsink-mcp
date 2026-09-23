@@ -13,7 +13,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { BugsinkClient, type Issue, type Event, type Release } from "./bugsink-client.js";
+import { BugsinkClient, MUTE_PERIODS, type Issue, type Event, type Release } from "./bugsink-client.js";
 
 // Environment configuration
 const BUGSINK_URL = process.env.BUGSINK_URL;
@@ -39,21 +39,30 @@ const client = new BugsinkClient({
 // Initialize MCP server
 const server = new McpServer({
   name: "bugsink-mcp",
-  version: "0.2.0",
+  version: "0.3.0",
 });
 
 // Helper to derive status from issue flags
 function getIssueStatus(issue: Issue): string {
-  if (issue.is_resolved) return 'resolved';
+  if (issue.is_resolved) {
+    if (issue.is_resolved_by_next_release) return 'resolved (by next release)';
+    if (issue.is_resolved_unconditionally === false) return 'resolved (in a release)';
+    return 'resolved';
+  }
   if (issue.is_muted) return 'muted';
   return 'unresolved';
 }
+
+// Shared description for issue-ID parameters. Bugsink accepts either form
+// everywhere an issue is looked up (>= 2.2.1).
+const ISSUE_ID_DESC = "The issue ID: either the UUID or the friendly ID (e.g. 'PROD-QUASAR-SITE-42')";
 
 // Helper to format issue for display
 function formatIssue(issue: Issue): string {
   return [
     `[${issue.calculated_type}] ${issue.calculated_value}`,
     `  ID: ${issue.id}`,
+    issue.friendly_id ? `  Friendly ID: ${issue.friendly_id}` : null,
     `  Status: ${getIssueStatus(issue)}`,
     `  Occurrences: ${issue.digested_event_count}`,
     `  First seen: ${issue.first_seen}`,
@@ -158,12 +167,13 @@ function formatPagination(response: { next: string | null; previous: string | nu
 // List Projects
 server.tool(
   "list_projects",
-  "List all projects in the Bugsink instance",
+  "List all projects in the Bugsink instance, optionally filtered by team",
   {
+    team_id: z.string().optional().describe("Only list projects belonging to this team UUID"),
     cursor: z.string().optional().describe("Pagination cursor from a previous response's 'Next cursor' or 'Previous cursor'"),
   },
-  async ({ cursor }) => {
-    const response = await client.listProjects({ cursor });
+  async ({ team_id, cursor }) => {
+    const response = await client.listProjects({ team: team_id, cursor });
 
     if (response.results.length === 0) {
       return {
@@ -215,8 +225,8 @@ server.tool(
     project_id: z.number().describe("The project ID to list issues for"),
     status: z.string().optional().describe("Filter by status (e.g., 'unresolved', 'resolved', 'muted')"),
     limit: z.number().optional().default(25).describe("Maximum number of issues to return (default: 25)"),
-    sort: z.enum(['digest_order', 'last_seen']).optional().describe("Sort mode: 'digest_order' or 'last_seen' (default: digest_order)"),
-    order: z.enum(['asc', 'desc']).optional().describe("Sort order: 'asc' or 'desc' (default: desc)"),
+    sort: z.enum(['digest_order', 'last_seen', 'digested_event_count']).optional().describe("Sort mode: 'digest_order' (creation order), 'last_seen' (recent activity), or 'digested_event_count' (highest-impact first when combined with order=desc). Default: digest_order"),
+    order: z.enum(['asc', 'desc']).optional().describe("Sort order: 'asc' or 'desc' (server default: asc). Use 'desc' with last_seen or digested_event_count to get the most recent / most frequent issues first"),
     cursor: z.string().optional().describe("Pagination cursor from a previous response's 'Next cursor' or 'Previous cursor'"),
   },
   async ({ project_id, status, limit, sort, order, cursor }) => {
@@ -241,7 +251,7 @@ server.tool(
   "get_issue",
   "Get detailed information about a specific issue",
   {
-    issue_id: z.string().describe("The issue ID (UUID) to retrieve"),
+    issue_id: z.string().describe(ISSUE_ID_DESC),
   },
   async ({ issue_id }) => {
     const issue = await client.getIssue(issue_id);
@@ -259,7 +269,7 @@ server.tool(
   "analyze_issue_context",
   "Holistic analysis tool: retrieves issue details, recent events, and full stacktrace in one call.",
   {
-    issue_id: z.string().describe("The issue ID (UUID) to analyze"),
+    issue_id: z.string().describe(ISSUE_ID_DESC),
   },
   async ({ issue_id }) => {
     const [issue, events] = await Promise.all([
@@ -307,14 +317,15 @@ server.tool(
 // List Events
 server.tool(
   "list_events",
-  "List events (individual error occurrences) for a specific issue. Returns basic event info.",
+  "List events (individual error occurrences) for a specific issue. Returns basic event info, newest first by default.",
   {
-    issue_id: z.string().describe("The issue ID (UUID) to list events for"),
+    issue_id: z.string().describe(ISSUE_ID_DESC),
     limit: z.number().optional().default(10).describe("Maximum number of events to return (default: 10)"),
+    order: z.enum(['asc', 'desc']).optional().describe("'desc' for newest first (default), 'asc' for oldest first"),
     cursor: z.string().optional().describe("Pagination cursor from a previous response's 'Next cursor' or 'Previous cursor'"),
   },
-  async ({ issue_id, limit, cursor }) => {
-    const response = await client.listEvents(issue_id, { limit, cursor });
+  async ({ issue_id, limit, order, cursor }) => {
+    const response = await client.listEvents(issue_id, { limit, order, cursor });
 
     if (response.results.length === 0) {
       return {
@@ -387,22 +398,26 @@ server.tool(
     project_id: z.number().describe("The project ID to retrieve"),
   },
   async ({ project_id }) => {
-    const project = await client.getProject(project_id);
+    const project = await client.getProject(project_id, { expandTeam: true });
+    const team = typeof project.team === 'string'
+      ? project.team
+      : `${project.team.name} (ID: ${project.team.id})`;
 
     const text = [
       `Project: ${project.name}`,
       `  ID: ${project.id}`,
       `  Slug: ${project.slug}`,
-      `  Team: ${project.team}`,
+      `  Team: ${team}`,
       `  DSN: ${project.dsn}`,
       `  Visibility: ${project.visibility}`,
       `  Events: ${project.stored_event_count} stored, ${project.digested_event_count} digested`,
       `  Retention: ${project.retention_max_event_count} max events`,
+      project.grouping_mechanism ? `  Grouping mechanism: ${project.grouping_mechanism}` : null,
       `  Alerts:`,
       `    New issue: ${project.alert_on_new_issue}`,
       `    Regression: ${project.alert_on_regression}`,
       `    Unmute: ${project.alert_on_unmute}`,
-    ].join('\n');
+    ].filter(Boolean).join('\n');
 
     return {
       content: [{ type: "text", text }],
@@ -516,6 +531,130 @@ server.tool(
         type: "text",
         text: `Team updated successfully:\n  Name: ${team.name}\n  ID: ${team.id}\n  Visibility: ${team.visibility}`
       }],
+    };
+  }
+);
+
+// ============================================================================
+// Issue Triage Tools (require Bugsink >= 2.2.1; reopen requires >= 2.4.0)
+// ============================================================================
+
+// Resolve Issue
+server.tool(
+  "resolve_issue",
+  "Mark an issue as resolved. Mode 'now' resolves unconditionally; 'next_release' resolves once a newer release reports in; 'latest_release' marks it fixed in the project's latest known release (fails if the project has no releases). Fails if the issue is already resolved.",
+  {
+    issue_id: z.string().describe(ISSUE_ID_DESC),
+    mode: z.enum(['now', 'next_release', 'latest_release']).optional().default('now').describe("How to resolve: 'now' (default), 'next_release', or 'latest_release'"),
+  },
+  async ({ issue_id, mode }) => {
+    const issue = mode === 'next_release'
+      ? await client.resolveIssueNext(issue_id)
+      : mode === 'latest_release'
+        ? await client.resolveIssueLatest(issue_id)
+        : await client.resolveIssue(issue_id);
+
+    return {
+      content: [{ type: "text", text: `Issue resolved (${mode}):\n${formatIssue(issue)}` }],
+    };
+  }
+);
+
+// Reopen Issue
+server.tool(
+  "reopen_issue",
+  "Reopen a resolved issue, marking it unresolved again. Fails if the issue is not resolved.",
+  {
+    issue_id: z.string().describe(ISSUE_ID_DESC),
+  },
+  async ({ issue_id }) => {
+    const issue = await client.reopenIssue(issue_id);
+    return {
+      content: [{ type: "text", text: `Issue reopened:\n${formatIssue(issue)}` }],
+    };
+  }
+);
+
+// Mute Issue
+server.tool(
+  "mute_issue",
+  "Mute an issue so it stops alerting. With no extra arguments it is muted indefinitely. Pass period_name + nr_of_periods to mute for a duration (e.g. 3 days). Additionally pass gte_threshold to mute until that many events occur within the period (e.g. unmute if 10+ events in 1 hour). Fails if the issue is resolved or already muted.",
+  {
+    issue_id: z.string().describe(ISSUE_ID_DESC),
+    period_name: z.enum(MUTE_PERIODS).optional().describe("Period unit for a timed or volume-based mute"),
+    nr_of_periods: z.number().int().min(1).optional().describe("Number of periods (e.g. 3 with period_name 'day' = 3 days)"),
+    gte_threshold: z.number().int().min(1).optional().describe("If set, unmute once this many events arrive within the period instead of after the period elapses"),
+  },
+  async ({ issue_id, period_name, nr_of_periods, gte_threshold }) => {
+    const hasPeriod = period_name !== undefined || nr_of_periods !== undefined;
+    if (hasPeriod && (period_name === undefined || nr_of_periods === undefined)) {
+      throw new Error("period_name and nr_of_periods must be provided together");
+    }
+    if (gte_threshold !== undefined && !hasPeriod) {
+      throw new Error("gte_threshold requires period_name and nr_of_periods");
+    }
+
+    let issue: Issue;
+    let how: string;
+    if (gte_threshold !== undefined) {
+      issue = await client.muteIssueUntil(issue_id, period_name!, nr_of_periods!, gte_threshold);
+      how = `until ${gte_threshold}+ events in ${nr_of_periods} ${period_name}(s)`;
+    } else if (hasPeriod) {
+      issue = await client.muteIssueFor(issue_id, period_name!, nr_of_periods!);
+      how = `for ${nr_of_periods} ${period_name}(s)`;
+    } else {
+      issue = await client.muteIssue(issue_id);
+      how = 'indefinitely';
+    }
+
+    return {
+      content: [{ type: "text", text: `Issue muted ${how}:\n${formatIssue(issue)}` }],
+    };
+  }
+);
+
+// Unmute Issue
+server.tool(
+  "unmute_issue",
+  "Unmute a muted issue so it alerts again. Fails if the issue is not muted.",
+  {
+    issue_id: z.string().describe(ISSUE_ID_DESC),
+  },
+  async ({ issue_id }) => {
+    const issue = await client.unmuteIssue(issue_id);
+    return {
+      content: [{ type: "text", text: `Issue unmuted:\n${formatIssue(issue)}` }],
+    };
+  }
+);
+
+// Delete Issue
+server.tool(
+  "delete_issue",
+  "Permanently delete an issue and all of its events. This cannot be undone; confirm with the user before calling.",
+  {
+    issue_id: z.string().describe(ISSUE_ID_DESC),
+  },
+  async ({ issue_id }) => {
+    await client.deleteIssue(issue_id);
+    return {
+      content: [{ type: "text", text: `Issue ${issue_id} deleted.` }],
+    };
+  }
+);
+
+// Comment on Issue
+server.tool(
+  "comment_on_issue",
+  "Add a comment to an issue's timeline (e.g. notes on root cause or a link to a fix). Comments made via the API are not attributed to a user.",
+  {
+    issue_id: z.string().describe(ISSUE_ID_DESC),
+    comment: z.string().min(1).describe("The comment text"),
+  },
+  async ({ issue_id, comment }) => {
+    const result = await client.createIssueComment(issue_id, comment);
+    return {
+      content: [{ type: "text", text: `Comment added to issue ${result.issue} (comment ID: ${result.id}, at ${result.timestamp})` }],
     };
   }
 );

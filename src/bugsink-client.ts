@@ -18,7 +18,8 @@ export interface PaginatedResponse<T> {
 
 export interface Project {
   id: number;
-  team: string;
+  /** Team UUID, or the full Team object when fetched with `expand=team`. */
+  team: string | Team;
   name: string;
   slug: string;
   dsn: string;
@@ -29,6 +30,8 @@ export interface Project {
   alert_on_unmute: boolean;
   visibility: string;
   retention_max_event_count: number;
+  /** Grouping mechanism version (Bugsink >= 2.5.0), e.g. "bugsink-v1" or "bugsink-v2". */
+  grouping_mechanism?: string;
 }
 
 export interface Team {
@@ -39,6 +42,8 @@ export interface Team {
 
 export interface Issue {
   id: string;
+  /** Human-readable ID like "PROD-QUASAR-SITE-42" (Bugsink >= 2.2.1). Accepted anywhere an issue ID is. */
+  friendly_id?: string;
   project: number;
   digest_order: number;
   first_seen: string;
@@ -49,9 +54,23 @@ export interface Issue {
   calculated_value: string;
   transaction: string;
   is_resolved: boolean;
+  is_resolved_unconditionally?: boolean;
   is_resolved_by_next_release: boolean;
   is_muted: boolean;
 }
+
+export interface IssueComment {
+  id: number;
+  issue: string;
+  project: number;
+  timestamp: string;
+  comment: string;
+  user: number | null;
+}
+
+/** Period names accepted by the mute-for / mute-until endpoints. */
+export const MUTE_PERIODS = ['minute', 'hour', 'day', 'week', 'month', 'year'] as const;
+export type MutePeriod = (typeof MUTE_PERIODS)[number];
 
 export interface StackFrame {
   filename: string;
@@ -379,14 +398,22 @@ export class BugsinkClient {
       throw new Error(`Bugsink API error (${response.status}): ${errorText}`);
     }
 
-    return response.json() as Promise<T>;
+    // DELETE returns 204 with no body; guard against parsing an empty response.
+    if (response.status === 204) {
+      return undefined as T;
+    }
+    const text = await response.text();
+    return (text ? JSON.parse(text) : undefined) as T;
   }
 
   /**
    * List all projects
    */
-  async listProjects(options?: { cursor?: string }): Promise<PaginatedResponse<Project>> {
+  async listProjects(options?: { cursor?: string; team?: string }): Promise<PaginatedResponse<Project>> {
     const params = new URLSearchParams();
+    if (options?.team) {
+      params.set('team', options.team);
+    }
     if (options?.cursor) {
       params.set('cursor', options.cursor);
     }
@@ -395,10 +422,12 @@ export class BugsinkClient {
   }
 
   /**
-   * Get a specific project by ID
+   * Get a specific project by ID. With `expandTeam`, `team` is returned as a
+   * full Team object instead of a UUID.
    */
-  async getProject(projectId: number): Promise<Project> {
-    return this.fetch<Project>(`/projects/${projectId}/`);
+  async getProject(projectId: number, options?: { expandTeam?: boolean }): Promise<Project> {
+    const qs = options?.expandTeam ? '?expand=team' : '';
+    return this.fetch<Project>(`/projects/${projectId}/${qs}`);
   }
 
   /**
@@ -418,14 +447,14 @@ export class BugsinkClient {
    *
    * Bugsink's API only supports cursor-based pagination and exposes no `status`
    * filter (per the OpenAPI spec: only `cursor`, `project`, `sort`, `order` are
-   * accepted). `limit` and `status` are enforced client-side via the composite
+   * accepted). `sort=digested_event_count` requires Bugsink >= 2.5.0. `limit` and `status` are enforced client-side via the composite
    * cursor helper, so paginating with a small `limit` walks through items
    * correctly across server-page boundaries.
    */
   async listIssues(projectId: number, options?: {
     status?: string;
     limit?: number;
-    sort?: 'digest_order' | 'last_seen';
+    sort?: 'digest_order' | 'last_seen' | 'digested_event_count';
     order?: 'asc' | 'desc';
     cursor?: string;
   }): Promise<PaginatedResponse<Issue>> {
@@ -459,10 +488,10 @@ export class BugsinkClient {
   }
 
   /**
-   * Get a specific issue by ID
+   * Get a specific issue by UUID or friendly ID (e.g. "PROD-QUASAR-SITE-42")
    */
   async getIssue(issueId: string): Promise<Issue> {
-    return this.fetch<Issue>(`/issues/${issueId}/`);
+    return this.fetch<Issue>(`/issues/${encodeURIComponent(issueId)}/`);
   }
 
   /**
@@ -472,9 +501,13 @@ export class BugsinkClient {
    * only `cursor`, `issue`, `order` are accepted). `limit` is enforced
    * client-side via the composite cursor helper, so paginating with a small
    * `limit` walks through events correctly across server-page boundaries.
+   *
+   * Server default order is `desc` (newest first). `issueId` may be a UUID or
+   * a friendly ID.
    */
   async listEvents(issueId: string, options?: {
     limit?: number;
+    order?: 'asc' | 'desc';
     cursor?: string;
   }): Promise<PaginatedResponse<Event>> {
     const limit = options?.limit ?? 10;
@@ -482,11 +515,14 @@ export class BugsinkClient {
     const fetchServerPage = (serverCursor: string | null) => {
       const params = new URLSearchParams();
       params.set('issue', issueId);
+      if (options?.order) params.set('order', options.order);
       if (serverCursor) params.set('cursor', serverCursor);
       return this.fetch<PaginatedResponse<Event>>(`/events/?${params.toString()}`);
     };
 
-    return paginateWithLimit(fetchServerPage, (items) => items, limit, options?.cursor);
+    const signature = `order=${options?.order ?? ''}`;
+
+    return paginateWithLimit(fetchServerPage, (items) => items, limit, options?.cursor, signature);
   }
 
   /**
@@ -566,6 +602,85 @@ export class BugsinkClient {
   }
 
   // ============================================================================
+  // Issue Triage Methods (Bugsink >= 2.2.1; reopen >= 2.4.0)
+  //
+  // All accept a UUID or friendly ID. The server rejects no-op transitions
+  // with a 400 (e.g. resolving an already-resolved issue).
+  // ============================================================================
+
+  private issueAction(issueId: string, action: string, body?: unknown): Promise<Issue> {
+    return this.fetch<Issue>(`/issues/${encodeURIComponent(issueId)}/${action}/`, {
+      method: 'POST',
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  }
+
+  /** Mark an issue as resolved. */
+  async resolveIssue(issueId: string): Promise<Issue> {
+    return this.issueAction(issueId, 'resolve');
+  }
+
+  /** Mark an issue as resolved by the next release. */
+  async resolveIssueNext(issueId: string): Promise<Issue> {
+    return this.issueAction(issueId, 'resolve-next');
+  }
+
+  /** Mark an issue as resolved in the project's latest release. Fails if the project has no releases. */
+  async resolveIssueLatest(issueId: string): Promise<Issue> {
+    return this.issueAction(issueId, 'resolve-latest');
+  }
+
+  /** Reopen a resolved issue. */
+  async reopenIssue(issueId: string): Promise<Issue> {
+    return this.issueAction(issueId, 'reopen');
+  }
+
+  /** Mute an issue indefinitely. */
+  async muteIssue(issueId: string): Promise<Issue> {
+    return this.issueAction(issueId, 'mute');
+  }
+
+  /** Mute an issue for a relative period, e.g. 3 days. */
+  async muteIssueFor(issueId: string, periodName: MutePeriod, nrOfPeriods: number): Promise<Issue> {
+    return this.issueAction(issueId, 'mute-for', {
+      period_name: periodName,
+      nr_of_periods: nrOfPeriods,
+    });
+  }
+
+  /** Mute an issue until a volume threshold is reached, e.g. more than 10 events in 1 hour. */
+  async muteIssueUntil(
+    issueId: string,
+    periodName: MutePeriod,
+    nrOfPeriods: number,
+    gteThreshold: number,
+  ): Promise<Issue> {
+    return this.issueAction(issueId, 'mute-until', {
+      period_name: periodName,
+      nr_of_periods: nrOfPeriods,
+      gte_threshold: gteThreshold,
+    });
+  }
+
+  /** Unmute a muted issue. */
+  async unmuteIssue(issueId: string): Promise<Issue> {
+    return this.issueAction(issueId, 'unmute');
+  }
+
+  /** Delete an issue (soft-deleted server-side, then cleaned up asynchronously). */
+  async deleteIssue(issueId: string): Promise<void> {
+    await this.fetch<void>(`/issues/${encodeURIComponent(issueId)}/`, { method: 'DELETE' });
+  }
+
+  /** Add a comment to an issue's timeline. */
+  async createIssueComment(issueId: string, comment: string): Promise<IssueComment> {
+    return this.fetch<IssueComment>('/issue-comments/', {
+      method: 'POST',
+      body: JSON.stringify({ issue: issueId, comment }),
+    });
+  }
+
+  // ============================================================================
   // Stacktrace Methods
   // ============================================================================
 
@@ -573,7 +688,7 @@ export class BugsinkClient {
    * Get event stacktrace as pre-rendered Markdown
    */
   async getEventStacktrace(eventId: string): Promise<string> {
-    const url = `${this.baseUrl}/api/canonical/0/events/${eventId}/stacktrace/`;
+    const url = `${this.baseUrl}/api/canonical/0/events/${encodeURIComponent(eventId)}/stacktrace/`;
 
     const response = await fetch(url, {
       headers: {
